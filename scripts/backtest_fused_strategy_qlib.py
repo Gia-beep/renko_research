@@ -62,7 +62,10 @@ expressions = {
     "is_above_ma20": "$close > Mean($close, 20)",
     "has_pullback": "Ref(Sum($close < $open, 4), 1) > 0",
     "is_high_vol": "$volume > 1.5 * Mean($volume, 20)",
-    "is_above_vwap": "$close > ($open + $high + $low + $close) / 4"
+    # Not true VWAP — this is the OHLC mean (typical price). Kept under
+    # an honest name; switch to Sum(($high+$low+$close)/3*$volume,N)/Sum($volume,N)
+    # if real VWAP is wanted.
+    "is_above_typical_price": "$close > ($open + $high + $low + $close) / 4"
 }
 
 # The final signal is the logical AND of all these conditions
@@ -76,16 +79,6 @@ end_time = "2020-12-31"
 market = "csi1000" # We can use csi300 as a default pool, or 'all'
 
 print(f"Loading data from {start_time} to {end_time} for market {market}...")
-# Create a DataHandler using expressions
-data_handler_args = {
-    "instruments": market,
-    "start_time": start_time,
-    "end_time": end_time,
-    "infer_processors": [],
-    "learn_processors": [],
-    "fit_start_time": start_time,
-    "fit_end_time": end_time,
-}
 
 # D.features
 features_df = D.features(D.instruments(market), fields, start_time, end_time)
@@ -97,7 +90,18 @@ for cond in expressions.keys():
 
 # vwap debug removed
 
-features_df['signal'] = features_df[list(expressions.keys())].product(axis=1)
+# All conditions must be true — booleans → 0/1 float for downstream weighting.
+features_df['signal'] = features_df[list(expressions.keys())].all(axis=1).astype(float)
+
+# Joint diagnostics: with 7 ANDed conditions, the basket can collapse to ~0
+# or explode; per-condition hit rates above don't tell you which.
+joint_hit_rate = features_df['signal'].mean()
+basket_sizes = features_df['signal'].gt(0.5).groupby(level='datetime').sum()
+print(f"\nJoint signal hit rate: {joint_hit_rate:.4%}")
+print(f"Daily basket size — median: {basket_sizes.median():.0f}, "
+      f"mean: {basket_sizes.mean():.1f}, "
+      f"p95: {basket_sizes.quantile(0.95):.0f}, "
+      f"max: {basket_sizes.max():.0f}")
 
 # 4. Integrate Macro Filter
 macro_df = get_macro_state()
@@ -112,8 +116,11 @@ if macro_df is not None:
     # Apply macro filter to signal
     features_df['signal'] = features_df['signal'] * features_df['is_safe']
     features_df = features_df.set_index(['instrument', 'datetime'])
-else:
-    features_df['signal'] = features_df['signal']
+
+# Sort by (instrument, datetime) BEFORE computing next_ret. After the macro
+# merge above, row order is not guaranteed; groupby().pct_change().shift(-1)
+# only aligns correctly when each instrument's rows are date-sorted.
+features_df = features_df.sort_index()
 
 # 5. Generate Backtest trades
 # If signal is 1, we want to buy. Qlib TopkDropoutStrategy uses a score to rank.
@@ -142,10 +149,16 @@ for d in dates:
 
 # 6. Evaluate Returns
 print("Calculating returns...")
+# Round-trip transaction cost in basis points (A-share stamp + commission +
+# slippage). With a daily-rebalanced equal-weight basket, turnover is ~200%/day,
+# so we charge the full round-trip on every active day.
+COST_BPS = 20
+cost_per_active_day = COST_BPS / 10000.0
+
 # To evaluate returns simply without full backtest engine (which requires TopkDropout),
 # we can just calculate the daily returns from close to close.
 # Next day return:
-features_df['next_ret'] = features_df.groupby('instrument')['close'].pct_change().shift(-1)
+features_df['next_ret'] = features_df.groupby(level='instrument')['close'].pct_change().shift(-1)
 
 portfolio_returns = []
 for d in dates[:-1]:
@@ -153,32 +166,39 @@ for d in dates[:-1]:
     if not pos:
         portfolio_returns.append(0.0)
         continue
-    
+
     day_data = features_df.xs(d, level='datetime')
     # Get next_ret for selected stocks
     rets = day_data.loc[list(pos.keys()), 'next_ret']
-    # Mean return
-    port_ret = rets.mean()
-    # Fill nan with 0 (in case of suspension)
+    # Suspended picks (NaN) contribute 0 to the basket, not "skip and renormalize".
+    # rets.mean() with skipna=True would otherwise overstate when suspensions
+    # correlate with the signal (e.g. limit-up names).
+    port_ret = rets.fillna(0.0).mean()
     port_ret = 0.0 if pd.isna(port_ret) else port_ret
+    # Deduct round-trip cost since the basket fully rotates daily.
+    port_ret -= cost_per_active_day
     portfolio_returns.append(port_ret)
 
 portfolio_returns.append(0.0) # last day
 
 ret_series = pd.Series(portfolio_returns, index=dates)
 
-print("\nYearly Annualized Returns:")
-yearly_returns = ret_series.groupby(ret_series.index.year).apply(lambda x: x.mean() * 252 * 100)
+print("\nYearly Returns (compounded):")
+yearly_returns = ret_series.groupby(ret_series.index.year).apply(lambda x: ((1 + x).prod() - 1) * 100)
 for year, ret in yearly_returns.items():
     print(f"{year}: {ret:.2f}%")
 
 cum_ret = (1 + ret_series).cumprod()
+max_dd = (cum_ret / cum_ret.cummax() - 1).min()
 
 active_days = sum(1 for pos in positions.values() if pos)
-print(f"\nActive Trading Days (Days with >0 stocks picked): {active_days} / {len(dates)}")
-print(f"Total Cumulative Return (1-day hold): {cum_ret.iloc[-1]:.4f}")
+print(f"\nAssumed round-trip cost: {COST_BPS} bps per active day (daily rebalance ≈ 200% turnover).")
+print(f"Active Trading Days (Days with >0 stocks picked): {active_days} / {len(dates)} "
+      f"({active_days / len(dates):.1%})")
+print(f"Total Cumulative Return (1-day hold, net of costs): {cum_ret.iloc[-1]:.4f}")
 print(f"Overall Annualized Return: {ret_series.mean() * 252 * 100:.2f}%")
 print(f"Overall Annualized Volatility: {ret_series.std() * np.sqrt(252) * 100:.2f}%")
+print(f"Max Drawdown: {max_dd:.2%}")
 if ret_series.std() > 0:
     print(f"Overall Sharpe Ratio: {(ret_series.mean() / ret_series.std()) * np.sqrt(252):.2f}")
 else:
