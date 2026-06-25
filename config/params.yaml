@@ -1,0 +1,32 @@
+# Strategy & research parameters. Loaded via config.settings.load_params().
+
+universe:
+  source: "中证1000"        # 板块/指数名；推荐起点：沪深300 或 中证500
+  block_type: null          # 若 get_stock_list 需要 list_type 参数则填
+  start: "20250101"
+  end: "20251231"                   # "" = 最新
+
+renko:
+  mode: "atr"               # fixed | atr
+  fixed_brick: 1.0          # mode=fixed 时使用（绝对价格单位）
+  atr_window: 14            # mode=atr 时 ATR 窗口
+  atr_multiplier: 2.0       # 砖块大小 = ATR * multiplier
+
+indicators:
+  roc_window: 12
+  mtm_window: 12
+  rsi_window: 14
+  willr_window: 14
+
+strategy:
+  name: "renko_momentum"
+  long_threshold: 60        # 例：RSI > 60 → 做多
+  short_threshold: 40       # 例：RSI < 40 → 平仓/做空
+  top_n: 20                 # 横截面：按动量排名持有前 N 只
+
+backtest:
+  init_cash: 1000000
+  fees: 0.0003
+  slippage: 0.0
+  freq: "1d"
+  size_granularity: 100     # A股整手；科创/北交最低 200

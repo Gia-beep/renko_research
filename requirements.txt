@@ -1,0 +1,20 @@
+# Core
+pandas
+numpy
+pyyaml
+pyqlib
+
+# Backtesting
+vectorbt
+
+# Caching / IO
+pyarrow        # parquet cache for data/
+
+# Visualization
+matplotlib
+
+# Notebooks (optional)
+jupyterlab
+
+# Tests
+pytest

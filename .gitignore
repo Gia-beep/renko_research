@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# IDE
+.idea/
+
+# Data & results: keep folders, ignore contents
+data/raw/*
+data/renko/*
+data/qlib_csvs/*
+!data/**/.gitkeep
+results/*
+!results/.gitkeep
+
+# MLflow
+mlruns/
+
+# OS
+.DS_Store
+Thumbs.db
