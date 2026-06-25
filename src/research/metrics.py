@@ -130,6 +130,11 @@ def event_positions(
     max_hold: int,
     red_brick: pd.DataFrame | None = None,
     max_red_bricks: int | None = None,
+    close: pd.DataFrame | None = None,
+    no_rise_check_bars: int | None = None,
+    ma_white: pd.DataFrame | None = None,
+    ma_yellow: pd.DataFrame | None = None,
+    white_grace_bars: int = 1,
 ) -> pd.DataFrame:
     """Per-name holding mask: enter on ``entries``, leave on ``exits`` or ``max_hold``.
 
@@ -141,28 +146,108 @@ def event_positions(
     closed *on* the ``max_red_bricks``-th red brick (it does not earn that day's
     forward return).  Leaving either ``None`` (the default) disables the brick exit and
     reproduces the original ``exits``/``max_hold`` behaviour exactly.
+
+    Three optional layered risk-control exits (all default OFF; OR-combined with the
+    base ``exits`` mask):
+
+    * **§5.1 黄线零容忍 (yellow zero-tolerance):** when ``ma_yellow`` is supplied,
+      exit on the first bar where ``close < ma_yellow``.  Requires ``close``.
+    * **§5.1 白线连破 (white-line break with grace):** when ``ma_white`` is supplied,
+      maintain a per-name streak of consecutive ``close < ma_white`` bars; exit when
+      the streak reaches ``white_grace_bars + 1`` (default 2 = yesterday + today both
+      below white).  Requires ``close``.
+    * **§5.1 次日不涨即走 (T+N no-rise check):** when ``no_rise_check_bars`` is a
+      positive int, snapshot the entry-bar close and exit on the
+      ``no_rise_check_bars``-th post-entry bar (``age == no_rise_check_bars``) if
+      ``close`` is not strictly above the entry close.  Requires ``close``.
+
+    All three checks are applied *while holding* before the brick counter, and a
+    trigger flips ``holding`` to False on the current bar (the position does not
+    earn that day's forward return), mirroring the existing brick exit semantics.
     """
     entries = entries.fillna(False).astype(bool)
     exits = exits.fillna(False).astype(bool)
     use_max_hold = max_hold > 0
     use_brick = red_brick is not None and max_red_bricks is not None
+    use_yellow = ma_yellow is not None and close is not None
+    use_white = ma_white is not None and close is not None
+    use_no_rise = (
+        no_rise_check_bars is not None
+        and int(no_rise_check_bars) > 0
+        and close is not None
+    )
+    no_rise_age = int(no_rise_check_bars) if use_no_rise else 0
+    grace = max(0, int(white_grace_bars))
+
     if use_brick:
-        red_brick = red_brick.reindex(index=entries.index, columns=entries.columns).fillna(False).astype(bool)
+        red_brick = red_brick.reindex(
+            index=entries.index, columns=entries.columns
+        ).fillna(False).astype(bool)
+    if close is not None:
+        close = close.reindex(index=entries.index, columns=entries.columns).astype(float)
+    if use_yellow:
+        ma_yellow = ma_yellow.reindex(
+            index=entries.index, columns=entries.columns
+        ).astype(float)
+    if use_white:
+        ma_white = ma_white.reindex(
+            index=entries.index, columns=entries.columns
+        ).astype(float)
+
     positions = pd.DataFrame(False, index=entries.index, columns=entries.columns)
 
     for col in entries.columns:
         holding = False
         age = 0
         red_count = 0
+        white_streak = 0
+        entry_close = np.nan
         for dt in entries.index:
             if holding and (bool(exits.at[dt, col]) or (use_max_hold and age >= max_hold)):
                 holding = False
                 age = 0
                 red_count = 0
+                white_streak = 0
+                entry_close = np.nan
             if bool(entries.at[dt, col]):
                 holding = True
                 age = 0
                 red_count = 0
+                white_streak = 0
+                entry_close = float(close.at[dt, col]) if close is not None else np.nan
+            # §5.1 黄线零容忍: close < MA(yellow) -> exit on the same bar.
+            if holding and use_yellow:
+                c_val = close.at[dt, col]
+                y_val = ma_yellow.at[dt, col]
+                if pd.notna(c_val) and pd.notna(y_val) and float(c_val) < float(y_val):
+                    holding = False
+                    age = 0
+                    red_count = 0
+                    white_streak = 0
+                    entry_close = np.nan
+            # §5.1 白线连破: streak >= grace + 1 consecutive closes below MA(white).
+            if holding and use_white:
+                c_val = close.at[dt, col]
+                w_val = ma_white.at[dt, col]
+                if pd.notna(c_val) and pd.notna(w_val) and float(c_val) < float(w_val):
+                    white_streak += 1
+                else:
+                    white_streak = 0
+                if white_streak >= grace + 1:
+                    holding = False
+                    age = 0
+                    red_count = 0
+                    white_streak = 0
+                    entry_close = np.nan
+            # §5.1 次日不涨即走: at age == no_rise_check_bars, exit unless close > entry_close.
+            if holding and use_no_rise and age == no_rise_age:
+                c_val = close.at[dt, col]
+                if pd.isna(c_val) or pd.isna(entry_close) or float(c_val) <= float(entry_close):
+                    holding = False
+                    age = 0
+                    red_count = 0
+                    white_streak = 0
+                    entry_close = np.nan
             # renko.md §5.2: entry bar is red brick #1; exit on the max_red_bricks-th.
             if use_brick and holding and bool(red_brick.at[dt, col]):
                 red_count += 1
@@ -170,6 +255,8 @@ def event_positions(
                     holding = False
                     age = 0
                     red_count = 0
+                    white_streak = 0
+                    entry_close = np.nan
             positions.at[dt, col] = holding
             if holding:
                 age += 1
@@ -245,6 +332,10 @@ def event_strategy(
     max_hold: int,
     red_brick: pd.DataFrame | None = None,
     max_red_bricks: int | None = None,
+    no_rise_check_bars: int | None = None,
+    ma_white: pd.DataFrame | None = None,
+    ma_yellow: pd.DataFrame | None = None,
+    white_grace_bars: int = 1,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """Equal-weight next-day-return proxy for holding event positions.
 
@@ -252,6 +343,9 @@ def event_strategy(
     total/annualized return, Sharpe, max drawdown, exposure and average breadth.
     ``red_brick`` / ``max_red_bricks`` are forwarded to :func:`event_positions` to
     enable the renko.md §5.2 "数四块砖" exit (default ``None`` ⇒ disabled).
+    ``no_rise_check_bars`` / ``ma_white`` / ``ma_yellow`` / ``white_grace_bars`` are
+    forwarded to enable the §5.1 layered exits (next-day no-rise, white-line grace
+    break, yellow-line zero-tolerance); see :func:`event_positions` for semantics.
     """
     positions = event_positions(
         entries,
@@ -259,6 +353,11 @@ def event_strategy(
         max_hold=max_hold,
         red_brick=red_brick,
         max_red_bricks=max_red_bricks,
+        close=close,
+        no_rise_check_bars=no_rise_check_bars,
+        ma_white=ma_white,
+        ma_yellow=ma_yellow,
+        white_grace_bars=white_grace_bars,
     )
     next_ret = close.shift(-1) / close - 1.0
     valid_positions = positions & next_ret.notna()
@@ -307,6 +406,10 @@ def benchmark_hedged_event_strategy(
     max_hold: int,
     red_brick: pd.DataFrame | None = None,
     max_red_bricks: int | None = None,
+    no_rise_check_bars: int | None = None,
+    ma_white: pd.DataFrame | None = None,
+    ma_yellow: pd.DataFrame | None = None,
+    white_grace_bars: int = 1,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """Long event proxy plus an active-day equal-weight benchmark hedge.
 
@@ -321,6 +424,10 @@ def benchmark_hedged_event_strategy(
         max_hold=max_hold,
         red_brick=red_brick,
         max_red_bricks=max_red_bricks,
+        no_rise_check_bars=no_rise_check_bars,
+        ma_white=ma_white,
+        ma_yellow=ma_yellow,
+        white_grace_bars=white_grace_bars,
     )
     active = daily["active_names"] > 0
     daily["active_benchmark_return"] = daily["benchmark_return"].where(active, 0.0)
@@ -349,14 +456,34 @@ def long_short_event_strategy(
     *,
     max_hold: int,
     require_both_sides: bool = True,
+    long_no_rise_check_bars: int | None = None,
+    long_ma_white: pd.DataFrame | None = None,
+    long_ma_yellow: pd.DataFrame | None = None,
+    long_white_grace_bars: int = 1,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """Dollar-neutral event proxy: 50% long events and 50% short events.
 
     Short-leg return is the negative of the selected names' next-day return.
     With ``require_both_sides=True`` (default), the strategy is flat unless both
     long and short books are active on the same date.
+
+    The §5.1 layered long-stops (``long_no_rise_check_bars``, ``long_ma_white``,
+    ``long_ma_yellow``, ``long_white_grace_bars``) are forwarded to the long leg
+    only; the short leg keeps its existing ``short_exits`` / ``max_hold`` semantics
+    because "次日不涨即走" / "跌破均线" are long-side risk controls (their
+    short-side mirror — "次日不跌" / "突破均线" — would need to be supplied
+    explicitly via ``short_exits`` if desired).
     """
-    long_positions = event_positions(long_entries, long_exits, max_hold=max_hold)
+    long_positions = event_positions(
+        long_entries,
+        long_exits,
+        max_hold=max_hold,
+        close=close,
+        no_rise_check_bars=long_no_rise_check_bars,
+        ma_white=long_ma_white,
+        ma_yellow=long_ma_yellow,
+        white_grace_bars=long_white_grace_bars,
+    )
     short_positions = event_positions(short_entries, short_exits, max_hold=max_hold)
     next_ret = close.shift(-1) / close - 1.0
 
