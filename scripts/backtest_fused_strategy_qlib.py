@@ -50,16 +50,16 @@ def get_macro_state():
 # is_red: $close > $open
 # is_strong_red: ($close - $open) / ($high - $low + 1e-8) >= 0.666667
 # is_short_shadow: ($high - $close) / ($high - $low + 1e-8) <= 0.15
-# is_above_ma20: $close > Mean($close, 20)
+# is_dual_ma_bull: §3.2 stack — close>MA(yellow=60) AND MA(white=20)>MA(yellow=60)
 # has_pullback: Ref(Sum($close < $open, 4), 1) > 0
 # is_high_vol: $volume > 1.5 * Mean($volume, 20)
-# is_above_vwap: $close > $vwap
+# is_above_typical_price: $close > $vwap
 
 expressions = {
     "is_red": "$close > $open",
     "is_strong_red": "($close - $open) / ($high - $low + 1e-8) >= 0.666667",
     "is_short_shadow": "($high - $close) / ($high - $low + 1e-8) <= 0.15",
-    "is_above_ma20": "$close > Mean($close, 20)",
+    "is_dual_ma_bull": "($close > Mean($close, 60)) & (Mean($close, 20) > Mean($close, 60))",
     "has_pullback": "Ref(Sum($close < $open, 4), 1) > 0",
     "is_high_vol": "$volume > 1.5 * Mean($volume, 20)",
     # Not true VWAP — this is the OHLC mean (typical price). Kept under
