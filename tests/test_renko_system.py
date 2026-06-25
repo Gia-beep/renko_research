@@ -151,6 +151,74 @@ def test_event_positions_brick_exit_disabled_matches_legacy():
     assert off["A"].tolist() == legacy["A"].tolist() == [True, True, True, False, False, False]
 
 
+# --------------------------------------------------------------------------- #
+# §5.1 layered stops in event_positions (yellow zero-tolerance, white grace,
+# T+N no-rise) — synthetic single-name frames.
+# --------------------------------------------------------------------------- #
+def test_event_positions_yellow_zero_tolerance_exits_same_bar():
+    # Enter d0 with close=10 above MA60≈9. On d2 close falls to 8.0 < yellow=9.0
+    # → must exit on d2 (no grace).
+    entries = _frame({"A": [True, False, False, False, False]}, 5)
+    exits = _frame({"A": [False] * 5}, 5)
+    close = _frame({"A": [10.0, 10.5, 8.0, 8.5, 9.5]}, 5)
+    yellow = _frame({"A": [9.0, 9.0, 9.0, 9.0, 9.0]}, 5)
+    pos = event_positions(
+        entries, exits, max_hold=100, close=close, ma_yellow=yellow,
+    )
+    assert pos["A"].tolist() == [True, True, False, False, False]
+
+
+def test_event_positions_white_grace_requires_two_consecutive_breaks():
+    # white=9.5; close path 10, 9.0(break), 9.6(recover), 9.0(break), 9.0(break) → exit d4.
+    # Single-day break on d1 must NOT exit (grace=1 ⇒ need 2 consecutive).
+    entries = _frame({"A": [True, False, False, False, False]}, 5)
+    exits = _frame({"A": [False] * 5}, 5)
+    close = _frame({"A": [10.0, 9.0, 9.6, 9.0, 9.0]}, 5)
+    white = _frame({"A": [9.5, 9.5, 9.5, 9.5, 9.5]}, 5)
+    pos = event_positions(
+        entries, exits, max_hold=100, close=close, ma_white=white,
+    )
+    assert pos["A"].tolist() == [True, True, True, True, False]
+
+
+def test_event_positions_no_rise_check_t2_exits_if_not_above_entry():
+    # Entry d0 at close=10.  T+2 = d2.  Case A: d2 close 9.8 ≤ 10 ⇒ exit on d2.
+    entries = _frame({"A": [True, False, False, False]}, 4)
+    exits = _frame({"A": [False] * 4}, 4)
+    close_a = _frame({"A": [10.0, 10.5, 9.8, 11.0]}, 4)
+    pos_a = event_positions(
+        entries, exits, max_hold=100, close=close_a, no_rise_check_bars=2,
+    )
+    assert pos_a["A"].tolist() == [True, True, False, False]
+
+    # Case B: d2 close 10.5 > 10 ⇒ keep holding past the check.
+    close_b = _frame({"A": [10.0, 9.8, 10.5, 11.0]}, 4)
+    pos_b = event_positions(
+        entries, exits, max_hold=100, close=close_b, no_rise_check_bars=2,
+    )
+    assert pos_b["A"].tolist() == [True, True, True, True]
+
+
+def test_event_positions_layered_stops_coexist_and_yellow_takes_priority():
+    # Construct one trade where MULTIPLE rules would fire on d2: yellow break,
+    # second white break, T+2 not above entry. Any one is sufficient ⇒ exit on d2.
+    entries = _frame({"A": [True, False, False, False]}, 4)
+    exits = _frame({"A": [False] * 4}, 4)
+    # close: 10 (entry) -> 9.4 (below white) -> 8.0 (below yellow & white & entry)
+    close = _frame({"A": [10.0, 9.4, 8.0, 9.0]}, 4)
+    white = _frame({"A": [9.5, 9.5, 9.5, 9.5]}, 4)
+    yellow = _frame({"A": [9.0, 9.0, 9.0, 9.0]}, 4)
+    red = _frame({"A": [True, True, True, True]}, 4)
+    pos = event_positions(
+        entries, exits, max_hold=100,
+        close=close, ma_white=white, ma_yellow=yellow,
+        no_rise_check_bars=2,
+        red_brick=red, max_red_bricks=4,
+    )
+    # Exit on d2; must remain flat afterwards (red_count is reset on exit).
+    assert pos["A"].tolist() == [True, True, False, False]
+
+
 def test_renko_system_trendbreak_exit_is_or_with_turn_down():
     close = _frame({"A": [10.0, 8.0, 9.0, 7.0]}, 4)
     open_ = close - 1.0

@@ -17,6 +17,10 @@ Rules operationalised (authoritative definitions cross-checked against the origi
         we reproduce the "sleep in a bear regime" intent with a causal close>=SMA gate)
   - §5.2 "数四块砖" profit-take       -> ``metrics.event_strategy(max_red_bricks=4)``
   - §5.1 trend-break stop            -> close < MA(yellow), OR'd into the exit
+  - §5.1 layered policy stops        -> ``event_positions`` kwargs
+        ``ma_yellow`` (zero-tolerance), ``ma_white`` + ``white_grace_bars`` (2 consecutive
+        breaks default), and ``no_rise_check_bars`` (T+N close ≤ entry close ⇒ exit).
+        Bundled together as the ``full_policy`` variant; ablated by ``policy_minus_*``.
 
 Not modelled (documented fidelity limit): the §5.1 *next-day verification* (sell by
 T+1 09:37 if price hasn't risen) and the 14:57/09:30 timing are intraday rules that
@@ -72,6 +76,9 @@ class Variant:
     exits: pd.DataFrame
     max_hold: int
     max_red_bricks: int | None
+    # §5.1 layered stops (default OFF ⇒ legacy behaviour).
+    no_rise_bars: int | None = None
+    enforce_ma_stop: bool = False
 
 
 def _build_variants(
@@ -90,6 +97,7 @@ def _build_variants(
     vol_window: int,
     max_hold: int,
     max_red_bricks: int,
+    no_rise_bars: int = 2,
     factor_momentum: pd.DataFrame | None = None,
 ) -> list[Variant]:
     """Full renko.md system + single-rule entry/exit ablations.
@@ -97,6 +105,11 @@ def _build_variants(
     Entry-effect group (fixed exit = turn_down | max_hold): isolates each entry rule.
     Exit-effect group (fixed entry = full): isolates each exit rule.  ``full_calendar5``
     is the hinge (full entry, baseline exit) shared by both groups.
+
+    The ``full_policy`` variant operationalises the user-facing exit policy in one
+    cell: red→green soft exit + §5.2 four-brick + §5.1 yellow zero-tolerance, white
+    grace-1 break, and T+``no_rise_bars`` no-rise check.  ``policy_minus_*`` rows
+    ablate one new rule at a time so the marginal effect is measurable.
     """
     turn_up, turn_down, rising = alpha.turn_up, alpha.turn_down, alpha.rising
 
@@ -129,6 +142,23 @@ def _build_variants(
         Variant("full_brick4", e_full, exit_td, off, max_red_bricks),
         Variant("full_trendbreak", e_full, exit_tb, off, None),
         Variant("full_system", e_full, exit_tb, off, max_red_bricks),
+        # --- policy-stack group (red→green + §5.2 brick + §5.1 layered stops) ---
+        Variant(
+            "full_policy", e_full, exit_td, off, max_red_bricks,
+            no_rise_bars=no_rise_bars, enforce_ma_stop=True,
+        ),
+        Variant(
+            "policy_minus_no_rise", e_full, exit_td, off, max_red_bricks,
+            no_rise_bars=None, enforce_ma_stop=True,
+        ),
+        Variant(
+            "policy_minus_ma_stop", e_full, exit_td, off, max_red_bricks,
+            no_rise_bars=no_rise_bars, enforce_ma_stop=False,
+        ),
+        Variant(
+            "policy_minus_brick", e_full, exit_td, off, None,
+            no_rise_bars=no_rise_bars, enforce_ma_stop=True,
+        ),
     ]
     if factor_momentum is not None:
         fm = factor_momentum.reindex(index=close.index, columns=close.columns).fillna(False)
@@ -161,6 +191,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizons", nargs="+", type=int, default=[1, 3, 5, 10])
     parser.add_argument("--max-hold", type=int, default=5)
     parser.add_argument("--max-red-bricks", type=int, default=4, help="renko.md §5.2 数四块砖.")
+    parser.add_argument(
+        "--no-rise-bars", type=int, default=2,
+        help="renko.md §5.1 次日不涨即走 (T+N proxy on daily bars; 0 disables for full_policy).",
+    )
+    parser.add_argument(
+        "--white-grace-bars", type=int, default=1,
+        help="White-line break grace days (default 1 ⇒ need 2 consecutive breaks).",
+    )
     parser.add_argument("--amv-csv", type=Path, default=DEFAULT_AMV_CSV)
     parser.add_argument("--amv-sma", type=int, default=60, help="AMV regime trend-gate SMA window.")
     parser.add_argument("--body-ratio-min", type=float, default=2.0 / 3.0)
@@ -268,10 +306,15 @@ def main() -> None:
         body_ratio_min=args.body_ratio_min, upper_shadow_max=args.upper_shadow_max,
         white=args.white, yellow=args.yellow, vol_window=args.vol_window,
         max_hold=args.max_hold, max_red_bricks=args.max_red_bricks,
+        no_rise_bars=args.no_rise_bars if args.no_rise_bars > 0 else None,
         factor_momentum=factor_mask,
     )
 
     fwd = {h: forward_returns(close, h) for h in args.horizons}
+
+    # MA frames are reused across variants for the §5.1 policy stops.
+    ma_white_frame = moving_average(close, args.white)
+    ma_yellow_frame = moving_average(close, args.yellow)
 
     comparison_rows: list[dict[str, float | int | str]] = []
     event_rows: list[dict[str, float | int | str]] = []
@@ -288,6 +331,10 @@ def main() -> None:
         daily, strat = event_strategy(
             close, entries, v.exits,
             max_hold=v.max_hold, red_brick=alpha.rising, max_red_bricks=v.max_red_bricks,
+            no_rise_check_bars=v.no_rise_bars,
+            ma_white=ma_white_frame if v.enforce_ma_stop else None,
+            ma_yellow=ma_yellow_frame if v.enforce_ma_stop else None,
+            white_grace_bars=args.white_grace_bars,
         )
 
         if benchmark_row is None:
@@ -346,7 +393,9 @@ def main() -> None:
     pd.set_option("display.max_columns", 20)
     print(f"Market: {args.market}  range: {close.index.min().date()} -> {close.index.max().date()}")
     print(f"Panel: {close.shape[0]} days x {close.shape[1]} names | max_hold={args.max_hold} "
-          f"max_red_bricks={args.max_red_bricks} white={args.white} yellow={args.yellow} amv_sma={args.amv_sma}")
+          f"max_red_bricks={args.max_red_bricks} white={args.white} yellow={args.yellow} "
+          f"amv_sma={args.amv_sma} no_rise_bars={args.no_rise_bars} "
+          f"white_grace_bars={args.white_grace_bars}")
     if factor_result is not None:
         print(
             "Factor momentum: "
